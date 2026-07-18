@@ -700,7 +700,7 @@ export function getExportOptions(args: ExportArgs, options: ResolvedSlidevOption
   }
 }
 
-async function importPlaywright(): Promise<typeof import('playwright-chromium')> {
+export async function importPlaywright(): Promise<typeof import('playwright-chromium')> {
   const { userRoot, userWorkspaceRoot } = await getRoots()
 
   // 1. resolve from user root
