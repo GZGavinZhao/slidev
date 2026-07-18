@@ -1,6 +1,7 @@
 import type { Awaitable } from '@antfu/utils'
 import type { LoadedSlidevData } from '@slidev/parser/fs'
 import type { SlideInfo, SlidevConfig } from '@slidev/types'
+import type { CapturedError, ScreenshotResult } from './render'
 import { McpServer } from '@modelcontextprotocol/server'
 import { z } from 'zod'
 import { applySlidePatch, insertSlide, moveSlide, removeSlide, resolveSlide } from './operations'
@@ -14,6 +15,13 @@ export interface SlidevMcpNav {
   go: (page: number, clicks: number) => void
 }
 
+export interface SlidevMcpRender {
+  /** Screenshot a slide at a click step and color scheme. */
+  screenshot: (opts: { no: number, clicks: number, dark: boolean, scale?: number }) => Promise<ScreenshotResult>
+  /** Load a slide headlessly and report compilation/runtime errors. */
+  collectErrors: (opts: { no: number, dark: boolean }) => Promise<CapturedError[]>
+}
+
 export interface SlidevMcpContext {
   /** Slidev version */
   version: string
@@ -25,6 +33,8 @@ export interface SlidevMcpContext {
   getServerUrl?: () => string | undefined
   /** Live presentation navigation (only available with a running dev server) */
   nav?: SlidevMcpNav
+  /** Headless rendering (screenshots + error capture); dev server only */
+  render?: SlidevMcpRender
 }
 
 function result(data: any) {
@@ -124,7 +134,7 @@ export function createSlidevMcpServer(ctx: SlidevMcpContext): McpServer {
     'slidev-get-slide',
     {
       title: 'Get slide',
-      description: 'Get the full source of one slide: frontmatter, Markdown content, and speaker note.',
+      description: 'Get the full source of one slide: frontmatter, Markdown content, speaker note, and its 1-based line range in the source file.',
       inputSchema: z.object({ no: noSchema }),
       annotations: { readOnlyHint: true },
     },
@@ -133,6 +143,10 @@ export function createSlidevMcpServer(ctx: SlidevMcpContext): McpServer {
       const slide = resolveSlide(data, no)
       return result({
         ...slideSummary(slide),
+        // 1-based line range in the source markdown file (`file`).
+        startLine: slide.source.start + 1,
+        contentStartLine: slide.source.contentStart + 1,
+        endLine: slide.source.end,
         frontmatter: slide.source.frontmatter,
         content: slide.source.content.trim(),
         note: slide.source.note ?? null,
@@ -234,6 +248,82 @@ export function createSlidevMcpServer(ctx: SlidevMcpContext): McpServer {
         resolveSlide(data, no) // range check
         nav.go(no, clicks ?? 0)
         return result(`Navigated the presentation to slide ${no}${clicks ? ` (click ${clicks})` : ''}.`)
+      },
+    )
+  }
+
+  if (ctx.render) {
+    const render = ctx.render
+    const themeSchema = z
+      .enum(['light', 'dark'])
+      .optional()
+      .describe('Color scheme to render in (default "light"). Only honored when the deck\'s `colorSchema` is `auto`.')
+
+    server.registerTool(
+      'slidev-screenshot',
+      {
+        title: 'Screenshot slide',
+        description: [
+          'Render a slide with a headless browser and return a PNG image, so you can visually verify what a slide actually looks like after editing it.',
+          'You can target a specific click-animation step and choose light or dark mode.',
+          'The response also reports the slide\'s total click steps and any compilation/runtime errors detected while rendering.',
+        ].join(' '),
+        inputSchema: z.object({
+          no: noSchema,
+          clicks: z.number().int().min(0).optional().describe('Click animation step to reveal (0 = initial state, the default). Clamped to the slide\'s total clicks.'),
+          theme: themeSchema,
+          scale: z.number().min(1).max(3).optional().describe('Device scale factor for sharpness (default 1). Higher values produce larger images.'),
+        }),
+        annotations: { readOnlyHint: true, idempotentHint: true },
+      },
+      async ({ no, clicks, theme, scale }) => {
+        const data = await ctx.getData()
+        resolveSlide(data, no) // range check
+        const dark = theme === 'dark'
+        const shot = await render.screenshot({ no, clicks: clicks ?? 0, dark, scale })
+        const summary = {
+          slide: no,
+          theme: dark ? 'dark' : 'light',
+          clicksShown: shot.clicksShown,
+          clicksTotal: shot.clicksTotal,
+          ...shot.errors.length ? { errors: shot.errors } : {},
+        }
+        return {
+          content: [
+            { type: 'image' as const, data: shot.buffer.toString('base64'), mimeType: 'image/png' },
+            { type: 'text' as const, text: JSON.stringify(summary, null, 2) },
+          ],
+        }
+      },
+    )
+
+    server.registerTool(
+      'slidev-get-errors',
+      {
+        title: 'Check for errors',
+        description: [
+          'Render a slide with a headless browser and report any compilation errors (Vite/Vue transform failures shown in the dev error overlay) plus runtime console/page errors.',
+          'Use this after editing to confirm the deck still compiles.',
+          'Note: module-scoped compile errors surface on any slide that imports the broken module, while a component error specific to one slide only shows when that slide is loaded — pass the slide you edited.',
+        ].join(' '),
+        inputSchema: z.object({
+          no: z.number().int().min(1).optional().describe('Slide to load and check (1-based). Defaults to the live presentation\'s current slide, or slide 1.'),
+          theme: themeSchema,
+        }),
+        annotations: { readOnlyHint: true },
+      },
+      async ({ no, theme }) => {
+        const data = await ctx.getData()
+        const target = no ?? (ctx.nav?.getState().page || 1)
+        resolveSlide(data, target) // range check
+        const errors = await render.collectErrors({ no: target, dark: theme === 'dark' })
+        if (!errors.length)
+          return result(`No errors detected while rendering slide ${target}.`)
+        return result({
+          slide: target,
+          errorCount: errors.length,
+          errors,
+        })
       },
     )
   }

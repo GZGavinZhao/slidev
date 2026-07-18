@@ -1,3 +1,4 @@
+import { Buffer } from 'node:buffer'
 import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -5,6 +6,7 @@ import { Client, InMemoryTransport } from '@modelcontextprotocol/client'
 import { describe, expect, it, vi } from 'vitest'
 import { load } from '../packages/parser/src/fs'
 import { applySlidePatch, insertSlide, moveSlide, removeSlide } from '../packages/slidev/node/mcp/operations'
+import { printUrl } from '../packages/slidev/node/mcp/render'
 import { createSlidevMcpServer } from '../packages/slidev/node/mcp/server'
 
 const ENTRY_MD = `---
@@ -313,5 +315,160 @@ describe('mcp server', () => {
     await expect(client.callTool({ name: 'slidev-goto-slide', arguments: { no: 99 } }))
       .resolves
       .toMatchObject({ isError: true })
+  })
+
+  it('reports the source line range of a slide', async () => {
+    const { client } = await createServerAndClient()
+
+    // Slide 2 has no frontmatter, so its content starts on its first line
+    const slide2 = JSON.parse(textOf(await client.callTool({ name: 'slidev-get-slide', arguments: { no: 2 } })))
+    expect(slide2.startLine).toBe(9)
+    expect(slide2.contentStartLine).toBe(9)
+    expect(slide2.endLine).toBeGreaterThan(slide2.startLine)
+
+    // Slide 3 has frontmatter, so its content starts after the closing `---`
+    const slide3 = JSON.parse(textOf(await client.callTool({ name: 'slidev-get-slide', arguments: { no: 3 } })))
+    expect(slide3.startLine).toBe(18)
+    expect(slide3.contentStartLine).toBe(21)
+  })
+})
+
+describe('mcp render tools', () => {
+  function textOf(result: any) {
+    return result.content.find((c: any) => c.type === 'text').text as string
+  }
+
+  function createFakeRender() {
+    const screenshot = vi.fn(async ({ clicks }: { clicks: number }) => ({
+      buffer: Buffer.from('fake-png'),
+      clicksTotal: 5,
+      clicksShown: Math.min(clicks, 5),
+      errors: [],
+    }))
+    const collectErrors = vi.fn(async () => [
+      { type: 'vite-overlay' as const, message: 'boom.md:1:1\n[plugin:vite:vue] Error parsing' },
+    ])
+    return { screenshot, collectErrors }
+  }
+
+  async function createServerAndClient(render?: ReturnType<typeof createFakeRender>) {
+    const { entry, loadData } = await createDeck()
+    const server = createSlidevMcpServer({
+      version: '0.0.0-test',
+      entry,
+      getData: () => loadData(),
+      nav: { getState: () => ({ page: 2, clicks: 0 }), go: () => {} },
+      render,
+    })
+    const client = new Client({ name: 'test-client', version: '0.0.0' })
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
+    await Promise.all([
+      server.connect(serverTransport),
+      client.connect(clientTransport),
+    ])
+    return { client }
+  }
+
+  it('hides the render tools when rendering is unavailable', async () => {
+    const { client } = await createServerAndClient()
+    const names = (await client.listTools()).tools.map(t => t.name)
+    expect(names).not.toContain('slidev-screenshot')
+    expect(names).not.toContain('slidev-get-errors')
+  })
+
+  it('exposes the render tools when rendering is available', async () => {
+    const { client } = await createServerAndClient(createFakeRender())
+    const names = (await client.listTools()).tools.map(t => t.name)
+    expect(names).toContain('slidev-screenshot')
+    expect(names).toContain('slidev-get-errors')
+  })
+
+  it('returns a screenshot as image content plus a summary', async () => {
+    const render = createFakeRender()
+    const { client } = await createServerAndClient(render)
+
+    const result: any = await client.callTool({
+      name: 'slidev-screenshot',
+      arguments: { no: 3, clicks: 2, theme: 'dark' },
+    })
+    expect(result.isError).toBeFalsy()
+    expect(render.screenshot).toHaveBeenCalledWith({ no: 3, clicks: 2, dark: true, scale: undefined })
+
+    const image = result.content.find((c: any) => c.type === 'image')
+    expect(image.mimeType).toBe('image/png')
+    expect(Buffer.from(image.data, 'base64').toString()).toBe('fake-png')
+
+    const summary = JSON.parse(result.content.find((c: any) => c.type === 'text').text)
+    expect(summary).toMatchObject({ slide: 3, theme: 'dark', clicksShown: 2, clicksTotal: 5 })
+  })
+
+  it('defaults to light mode and clamps clicks to the slide total', async () => {
+    const render = createFakeRender()
+    const { client } = await createServerAndClient(render)
+
+    const result: any = await client.callTool({ name: 'slidev-screenshot', arguments: { no: 3, clicks: 99 } })
+    expect(render.screenshot).toHaveBeenCalledWith({ no: 3, clicks: 99, dark: false, scale: undefined })
+
+    const summary = JSON.parse(result.content.find((c: any) => c.type === 'text').text)
+    expect(summary).toMatchObject({ theme: 'light', clicksShown: 5, clicksTotal: 5 })
+  })
+
+  it('rejects screenshots of out-of-range slides', async () => {
+    const render = createFakeRender()
+    const { client } = await createServerAndClient(render)
+    await expect(client.callTool({ name: 'slidev-screenshot', arguments: { no: 99 } }))
+      .resolves
+      .toMatchObject({ isError: true })
+    expect(render.screenshot).not.toHaveBeenCalled()
+  })
+
+  it('reports compilation errors and defaults to the live slide', async () => {
+    const render = createFakeRender()
+    const { client } = await createServerAndClient(render)
+
+    const result = await client.callTool({ name: 'slidev-get-errors', arguments: {} })
+    // Defaults to the live presentation's current slide (2 in this harness)
+    expect(render.collectErrors).toHaveBeenCalledWith({ no: 2, dark: false })
+
+    const report = JSON.parse(textOf(result))
+    expect(report).toMatchObject({ slide: 2, errorCount: 1 })
+    expect(report.errors[0].type).toBe('vite-overlay')
+  })
+
+  it('reports no errors on a clean render', async () => {
+    const render = createFakeRender()
+    render.collectErrors.mockResolvedValueOnce([])
+    const { client } = await createServerAndClient(render)
+
+    const result = await client.callTool({ name: 'slidev-get-errors', arguments: { no: 3 } })
+    expect(textOf(result)).toMatch(/No errors detected/)
+  })
+})
+
+describe('mcp render urls', () => {
+  // Regression: `print=true` makes the client force-reveal every click step
+  // (`createFixedClicks(route, CLICKS_MAX)` in SlidesShow.vue) and ignore the
+  // `clicks` query, so screenshots of different click steps came out identical
+  // and `clicksTotal` read 0. `print=clicks` keeps the primary clicks context.
+  it('renders slides in click-aware print mode', () => {
+    const url = new URL(printUrl('http://localhost:3030/', 6, 3))
+    expect(url.pathname).toBe('/6')
+    expect(url.searchParams.get('print')).toBe('clicks')
+    expect(url.searchParams.get('clicks')).toBe('3')
+  })
+
+  it('limits the print range to the requested slide', () => {
+    const url = new URL(printUrl('http://localhost:3030/', 6, 0))
+    expect(url.searchParams.get('range')).toBe('6')
+  })
+
+  it('omits the clicks query at the initial state', () => {
+    const url = new URL(printUrl('http://localhost:3030/', 2, 0))
+    expect(url.searchParams.has('clicks')).toBe(false)
+  })
+
+  it('handles a base path without doubling slashes', () => {
+    expect(printUrl('http://localhost:3030/base/', 4, 1))
+      .toBe('http://localhost:3030/base/4?print=clicks&range=4&clicks=1')
   })
 })
