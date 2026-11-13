@@ -3,6 +3,7 @@ import type { Plugin, ViteDevServer } from 'vite'
 import type { SlidevMcpContext } from '../mcp/server'
 import { NodeStreamableHTTPServerTransport } from '@modelcontextprotocol/node'
 import { version } from '../../package.json'
+import { closeRenderBrowser, collectSlideErrors, screenshotSlide } from '../mcp/render'
 import { createSlidevMcpServer } from '../mcp/server'
 import { getServerRefState } from './serverRef'
 
@@ -28,6 +29,19 @@ export function createMcpPlugin(
       if (options.mode !== 'dev')
         return
 
+      const canvasSize = () => {
+        const config = options.data.config
+        const width = config.canvasWidth
+        const height = Math.round(config.canvasWidth / config.aspectRatio)
+        return { width, height }
+      }
+      const requireServerUrl = () => {
+        const url = server.resolvedUrls?.local[0]
+        if (!url)
+          throw new Error('The dev server URL is not available yet; try again once it has started.')
+        return url
+      }
+
       const ctx: SlidevMcpContext = {
         version,
         entry: options.entry,
@@ -40,7 +54,26 @@ export function createMcpPlugin(
           },
           go: (page, clicks) => navigateClients(server, options, page, clicks),
         },
+        render: {
+          screenshot: ({ no, clicks, dark, scale }) => screenshotSlide({
+            serverUrl: requireServerUrl(),
+            no,
+            clicks,
+            dark,
+            scale,
+            ...canvasSize(),
+          }),
+          collectErrors: ({ no, dark }) => collectSlideErrors({
+            serverUrl: requireServerUrl(),
+            no,
+            dark,
+            ...canvasSize(),
+          }),
+        },
       }
+
+      // Release the headless browser when the dev server shuts down.
+      server.httpServer?.once('close', () => void closeRenderBrowser())
 
       server.middlewares.use(async (req, res, next) => {
         const path = req.url?.split('?')[0]?.replace(/\/$/, '')
